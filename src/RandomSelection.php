@@ -136,20 +136,31 @@ class RandomSelection {
 		$options = [];
 		$r = 0;
 		$groupId = null;
-		// Define the reserved group IDs that bypass caching
+		$uncached = false;
 		$uncachedGroups = [ 'chaos', 'random', 'rand', 'none', 'c', 'r' ];
 
 		// 1. Process the first argument (string)
 		$arg = array_shift( $args );
 		$parts = explode( '=', $arg, 2 );
-		if ( count( $parts ) == 2 && trim( $parts[0] ) === 'group' ) {
-			$groupId = trim( $parts[1] );
-		} elseif ( count( $parts ) == 2 ) {
-			$options[] = [ intval( trim( $parts[0] ) ), $parts[1] ];
-			$r += intval( trim( $parts[0] ) );
+		if ( count( $parts ) == 2 ) {
+			$key = strtolower( trim( $parts[0] ) );
+			$val = trim( $parts[1] );
+			if ( $key === 'group' ) {
+				$groupId = $val;
+			} elseif ( $key === 'uncached' ) {
+				$uncached = !in_array( strtolower( $val ), [ '0', 'false', 'no' ], true );
+			} else {
+				$options[] = [ intval( $key ), $parts[1] ];
+				$r += intval( $key );
+			}
 		} elseif ( count( $parts ) == 1 ) {
-			$options[] = [ 1, $parts[0] ];
-			$r += 1;
+			$val = trim( $parts[0] );
+			if ( strtolower( $val ) === 'uncached' ) {
+				$uncached = true;
+			} else {
+				$options[] = [ 1, $parts[0] ];
+				$r += 1;
+			}
 		}
 
 		// 2. Process the remaining arguments (PPNode objects)
@@ -158,50 +169,71 @@ class RandomSelection {
 			$nameNode = $bits['name'];
 			$index = $bits['index'];
 			$valueNode = $bits['value'];
-			
+
 			if ( $index === '' ) {
-				$name = trim( $frame->expand( $nameNode ) );
-				// Intercept the group parameter
+				// Named parameter: key=value
+				$name = strtolower( trim( $frame->expand( $nameNode ) ) );
 				if ( $name === 'group' ) {
 					$groupId = trim( $frame->expand( $valueNode ) );
+					continue;
+				}
+				if ( $name === 'uncached' ) {
+					$val = trim( $frame->expand( $valueNode ) );
+					$uncached = !in_array( strtolower( $val ), [ '0', 'false', 'no' ], true );
 					continue;
 				}
 				$options[] = [ intval( $name ), $valueNode ];
 				$r += intval( $name );
 			} else {
+				// Positional parameter
+				$val = trim( $frame->expand( $valueNode ) );
+				if ( strtolower( $val ) === 'uncached' ) {
+					$uncached = true;
+					continue;
+				}
 				$options[] = [ 1, $valueNode ];
 				$r += 1;
 			}
 		}
 
-		// 3. Check if this group already rolled a pronoun (and ignore uncached groups)
-		if ( $groupId !== null 
-			&& !in_array( strtolower( $groupId ), $uncachedGroups, true ) 
-			&& isset( self::$groupCache[$groupId] ) ) {
-			return self::$groupCache[$groupId];
+		// 3. MediaWiki page cache expiry check
+		$config = MediaWikiServices::getInstance()->getMainConfig();
+		if ( $uncached && $config->get( 'RandomSelectionAllowUncached' ) ) {
+			$parser->getOutput()->updateCacheExpiry( 0 );
 		}
 
-		// 4. Choose an option at random
 		if ( $r <= 0 ) {
 			return '';
 		}
-		$r = mt_rand( 1, $r );
-		for ( $i = 0; $i < count( $options ); $i++ ) {
-			$r -= $options[$i][0];
-			if ( $r <= 0 ) {
-				$output = $options[$i][1];
-				break;
+
+		// 4. Determine the roll float (reuse cached float if group exists)
+		$isGroupUncached = ( $groupId === null || in_array( strtolower( $groupId ), $uncachedGroups, true ) );
+		if ( !$isGroupUncached && isset( self::$groupCache[$groupId] ) ) {
+			$roll = self::$groupCache[$groupId];
+		} else {
+			// Float in [0, 1)
+			$roll = mt_rand() / ( mt_getrandmax() + 1 );
+			if ( !$isGroupUncached ) {
+				self::$groupCache[$groupId] = $roll;
 			}
 		}
 
-		$finalOutput = trim( $frame->expand( $output ) );
-
-		// 5. Cache the result for this group ID (unless it's an uncached group)
-		if ( $groupId !== null && !in_array( strtolower( $groupId ), $uncachedGroups, true ) ) {
-			self::$groupCache[$groupId] = $finalOutput;
+		// 5. Select the option based on the normalized roll
+		$target = $roll * $r;
+		$current = 0;
+		$output = null;
+		foreach ( $options as $opt ) {
+			$current += $opt[0];
+			if ( $current > $target ) {
+				$output = $opt[1];
+				break;
+			}
+		}
+		if ( $output === null ) {
+			$output = end( $options )[1];
 		}
 
-		return $finalOutput;
+		return trim( $frame->expand( $output ) );
 	}
 
 }

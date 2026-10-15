@@ -4,9 +4,14 @@ use MediaWiki\MediaWikiServices;
 
 /**
  * RandomSelection -- randomly displays one of the given options.
- * Usage: <choose><option>A</option><option>B</option></choose>
- * Optional parameter: <option weight="3"> == 3x weight given
- * Optional parameter: <option group="1"> == randomization group 1
+ *
+ * Tag syntax:
+ *   <choose [group="name"] [uncached]><option>A</option><option>B</option></choose>
+ *   Optional attribute: <option weight="3"> == 3x weight given
+ *
+ * Parser function syntax:
+ *   {{#choose:[uncached]|[group=name]|option 1|...|option N}}
+ *   Optional weight: {{#choose:3=option 1|option 2}}
  *
  * @file
  * @ingroup Extensions
@@ -14,11 +19,21 @@ use MediaWiki\MediaWikiServices;
  * @link https://www.mediawiki.org/wiki/Extension:RandomSelection Documentation
  */
 class RandomSelection {
+
 	/**
-	 * Storage for per-page randomization cache groups.
+	 * Cache of normalized roll floats in [0, 1) keyed by group identifier.
+	 *
+	 * @var array<string, float>
 	 */
 	private static $groupCache = [];
-	
+
+	/**
+	 * Reserved group names that bypass caching and force a fresh random roll.
+	 *
+	 * @var string[]
+	 */
+	private static $uncachedGroups = [ 'chaos', 'random', 'rand', 'none', 'c', 'r' ];
+
 	/**
 	 * Register the <choose> tag and {{#choose:option 1|...|option N}} function
 	 * with the Parser.
@@ -41,19 +56,18 @@ class RandomSelection {
 	}
 
 	/**
-	 * Callback for register() which actually does all the processing.
+	 * Callback for register() which processes <choose> tag hooks.
 	 *
-	 * @param string $input User-supplied input
-	 * @param array $argv User-supplied arguments to the tag, e.g. <choose uncached>...</choose>
+	 * @param string $input User-supplied input inside the tag
+	 * @param array $argv User-supplied attributes to the tag (e.g. group, uncached, before, after)
 	 * @param MediaWiki\Parser\Parser $parser
 	 * @return string
 	 */
 	public static function render( $input, $argv, $parser ) {
-		$config = MediaWikiServices::getInstance()->getMainConfig();
-		# Prevent caching if specified so by the user
-		if ( isset( $argv['uncached'] ) && $config->get( 'RandomSelectionAllowUncached' ) ) {
-			$parser->getOutput()->updateCacheExpiry( 0 );
-		}
+		# Invalidate page cache if uncached is requested
+		$uncached = isset( $argv['uncached'] )
+			&& !in_array( strtolower( trim( $argv['uncached'] ) ), [ '0', 'false', 'no' ], true );
+		self::handleCacheExpiry( $uncached, $parser );
 
 		# Parse the options and calculate total weight
 		$len = preg_match_all(
@@ -94,11 +108,9 @@ class RandomSelection {
 			$weight = $weight / $normalizingFactor;
 		}
 
-		// Ok, so now we have an array of ascending weights
-		// that are cumulative. e.g. [0.25, 0.5, 0.75, 1].
-		// We get a random float, and pick the item with the
-		// smallest weight that is greater than our float.
-		$r = mt_rand() / mt_getrandmax();
+		# Retrieve cached or newly generated roll float
+		$groupId = isset( $argv['group'] ) ? trim( $argv['group'] ) : null;
+		$r = self::getRoll( $groupId );
 
 		$selectedContent = '';
 		for ( $i = 0; $i < count( $weights ); $i++ ) {
@@ -106,6 +118,9 @@ class RandomSelection {
 				$selectedContent = $out[2][$i];
 				break;
 			}
+		}
+		if ( $selectedContent === '' && count( $out[2] ) > 0 ) {
+			$selectedContent = end( $out[2] );
 		}
 
 		# Surround by template if applicable
@@ -125,7 +140,7 @@ class RandomSelection {
 	}
 
 	/**
-	 * Callback for the {{#choose:}} magic word magic (see register() in this file)
+	 * Callback for the {{#choose:}} magic word parser function.
 	 *
 	 * @param MediaWiki\Parser\Parser &$parser
 	 * @param MediaWiki\Parser\PPFrame $frame
@@ -137,7 +152,6 @@ class RandomSelection {
 		$r = 0;
 		$groupId = null;
 		$uncached = false;
-		$uncachedGroups = [ 'chaos', 'random', 'rand', 'none', 'c', 'r' ];
 
 		// 1. Process the first argument (string)
 		$arg = array_shift( $args );
@@ -197,28 +211,16 @@ class RandomSelection {
 		}
 
 		// 3. MediaWiki page cache expiry check
-		$config = MediaWikiServices::getInstance()->getMainConfig();
-		if ( $uncached && $config->get( 'RandomSelectionAllowUncached' ) ) {
-			$parser->getOutput()->updateCacheExpiry( 0 );
-		}
+		self::handleCacheExpiry( $uncached, $parser );
 
 		if ( $r <= 0 ) {
 			return '';
 		}
 
 		// 4. Determine the roll float (reuse cached float if group exists)
-		$isGroupUncached = ( $groupId === null || in_array( strtolower( $groupId ), $uncachedGroups, true ) );
-		if ( !$isGroupUncached && isset( self::$groupCache[$groupId] ) ) {
-			$roll = self::$groupCache[$groupId];
-		} else {
-			// Float in [0, 1)
-			$roll = mt_rand() / ( mt_getrandmax() + 1 );
-			if ( !$isGroupUncached ) {
-				self::$groupCache[$groupId] = $roll;
-			}
-		}
+		$roll = self::getRoll( $groupId );
 
-		// 5. Select the option based on the normalized roll
+		// 5. Select option based on the normalized roll
 		$target = $roll * $r;
 		$current = 0;
 		$output = null;
@@ -234,6 +236,42 @@ class RandomSelection {
 		}
 
 		return trim( $frame->expand( $output ) );
+	}
+
+	/**
+	 * Get an existing roll float for the given group, or roll and cache a new one.
+	 *
+	 * @param string|null $groupId The group identifier, or null if ungrouped
+	 * @return float A normalized float in the half-open interval [0, 1)
+	 */
+	private static function getRoll( $groupId ) {
+		$isUncached = ( $groupId === null || in_array( strtolower( $groupId ), self::$uncachedGroups, true ) );
+
+		if ( !$isUncached && isset( self::$groupCache[$groupId] ) ) {
+			return self::$groupCache[$groupId];
+		}
+
+		// Random float in [0, 1)
+		$roll = mt_rand() / ( mt_getrandmax() + 1 );
+
+		if ( !$isUncached ) {
+			self::$groupCache[$groupId] = $roll;
+		}
+
+		return $roll;
+	}
+
+	/**
+	 * Invalidate parser output cache if uncached selection is requested and allowed.
+	 *
+	 * @param bool $uncached
+	 * @param Parser $parser
+	 */
+	private static function handleCacheExpiry( $uncached, $parser ) {
+		$config = MediaWikiServices::getInstance()->getMainConfig();
+		if ( $uncached && $config->get( 'RandomSelectionAllowUncached' ) ) {
+			$parser->getOutput()->updateCacheExpiry( 0 );
+		}
 	}
 
 }

@@ -6,6 +6,7 @@ use MediaWiki\MediaWikiServices;
  * RandomSelection -- randomly displays one of the given options.
  * Usage: <choose><option>A</option><option>B</option></choose>
  * Optional parameter: <option weight="3"> == 3x weight given
+ * Optional parameter: <option group="1"> == randomization group 1
  *
  * @file
  * @ingroup Extensions
@@ -13,6 +14,11 @@ use MediaWiki\MediaWikiServices;
  * @link https://www.mediawiki.org/wiki/Extension:RandomSelection Documentation
  */
 class RandomSelection {
+	/**
+	 * Storage for per-page randomization cache groups.
+	 */
+	private static $groupCache = [];
+	
 	/**
 	 * Register the <choose> tag and {{#choose:option 1|...|option N}} function
 	 * with the Parser.
@@ -129,11 +135,16 @@ class RandomSelection {
 	public static function renderParserFunction( &$parser, $frame, $args ) {
 		$options = [];
 		$r = 0;
+		$groupId = null;
+		// Define the reserved group IDs that bypass caching
+		$uncachedGroups = [ 'chaos', 'random', 'rand', 'none', 'c', 'r' ];
 
-		// First one is not an object
+		// 1. Process the first argument (string)
 		$arg = array_shift( $args );
 		$parts = explode( '=', $arg, 2 );
-		if ( count( $parts ) == 2 ) {
+		if ( count( $parts ) == 2 && trim( $parts[0] ) === 'group' ) {
+			$groupId = trim( $parts[1] );
+		} elseif ( count( $parts ) == 2 ) {
 			$options[] = [ intval( trim( $parts[0] ) ), $parts[1] ];
 			$r += intval( trim( $parts[0] ) );
 		} elseif ( count( $parts ) == 1 ) {
@@ -141,13 +152,20 @@ class RandomSelection {
 			$r += 1;
 		}
 
+		// 2. Process the remaining arguments (PPNode objects)
 		foreach ( $args as $arg ) {
 			$bits = $arg->splitArg();
 			$nameNode = $bits['name'];
 			$index = $bits['index'];
 			$valueNode = $bits['value'];
+			
 			if ( $index === '' ) {
 				$name = trim( $frame->expand( $nameNode ) );
+				// Intercept the group parameter
+				if ( $name === 'group' ) {
+					$groupId = trim( $frame->expand( $valueNode ) );
+					continue;
+				}
 				$options[] = [ intval( $name ), $valueNode ];
 				$r += intval( $name );
 			} else {
@@ -156,7 +174,14 @@ class RandomSelection {
 			}
 		}
 
-		# Choose an option at random
+		// 3. Check if this group already rolled a pronoun (and ignore uncached groups)
+		if ( $groupId !== null 
+			&& !in_array( strtolower( $groupId ), $uncachedGroups, true ) 
+			&& isset( self::$groupCache[$groupId] ) ) {
+			return self::$groupCache[$groupId];
+		}
+
+		// 4. Choose an option at random
 		if ( $r <= 0 ) {
 			return '';
 		}
@@ -169,7 +194,14 @@ class RandomSelection {
 			}
 		}
 
-		return trim( $frame->expand( $output ) );
+		$finalOutput = trim( $frame->expand( $output ) );
+
+		// 5. Cache the result for this group ID (unless it's an uncached group)
+		if ( $groupId !== null && !in_array( strtolower( $groupId ), $uncachedGroups, true ) ) {
+			self::$groupCache[$groupId] = $finalOutput;
+		}
+
+		return $finalOutput;
 	}
 
 }

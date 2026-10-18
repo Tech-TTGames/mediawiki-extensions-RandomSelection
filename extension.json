@@ -1,13 +1,13 @@
 {
-	"name": "RandomSelection",
-	"version": "2.4.0",
+	"name": "RandomSelectionFork",
+	"version": "2.5.0",
 	"author": [
 		"Ross McClure",
 		"Jack Phoenix",
 		"..."
 	],
 	"license-name": "GPL-2.0-or-later",
-	"url": "https://www.mediawiki.org/wiki/Extension:RandomSelection",
+	"url": "https://github.com/Tech-TTGames/mediawiki-extensions-RandomSelection",
 	"descriptionmsg": "randomselection-desc",
 	"type": "parserhook",
 	"requires": {
